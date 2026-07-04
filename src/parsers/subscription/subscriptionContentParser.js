@@ -15,6 +15,78 @@ const SINGBOX_NON_PROXY_TYPES = new Set(['direct', 'block', 'dns', 'selector', '
 const SINGBOX_GROUP_TYPES = new Set(['selector', 'urltest']);
 
 /**
+ * Normalize non-standard VLESS links where the UUID section is Base64-encoded
+ * Handles formats like: vless://YXV0bzpVVUlE@host:port?...
+ * where YXV0bzpVVUlE decodes to auto:UUID or UUID@host:port
+ * 
+ * @param {string} content - Raw subscription content
+ * @returns {string} - Normalized content with standard VLESS links
+ */
+function normalizeVlessLinks(content) {
+    if (!content || typeof content !== 'string') {
+        return content;
+    }
+
+    return content.split(/\r?\n/).map(line => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('vless://')) {
+            return line;
+        }
+
+        try {
+            const url = new URL(trimmed);
+            const encodedUser = url.username;
+
+            // Check if username looks like Base64 (minimum 30 chars, only Base64 chars)
+            if (!encodedUser || encodedUser.length < 30 || !/^[A-Za-z0-9+/=]+$/.test(encodedUser)) {
+                return line;
+            }
+
+            // Try Base64 decode
+            let decoded;
+            try {
+                decoded = atob(encodedUser);
+            } catch (e) {
+                return line; // Not valid Base64
+            }
+
+            let newUuid = null;
+
+            // Pattern 1: auto:UUID
+            if (decoded.startsWith('auto:')) {
+                const uuid = decoded.slice(5); // Remove 'auto:' prefix
+                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid)) {
+                    newUuid = uuid;
+                }
+            }
+            // Pattern 2: UUID@host:port (entire connection string encoded)
+            else if (decoded.includes('@')) {
+                const parts = decoded.split('@');
+                const uuid = parts[0];
+                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid)) {
+                    newUuid = uuid;
+                }
+            }
+            // Pattern 3: Just UUID (some implementations encode only UUID)
+            else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(decoded)) {
+                newUuid = decoded;
+            }
+
+            if (newUuid) {
+                url.username = newUuid;
+                // Preserve all original query parameters and hash
+                return url.toString();
+            }
+
+        } catch (e) {
+            // Invalid URL or other error, keep original line
+        }
+
+        return line;
+    }).join('\n');
+}
+
+/**
  * Try to parse content as Sing-Box JSON format
  * @param {string} content - The content to parse
  * @returns {object|null} - Parsed result or null if not Sing-Box format
@@ -260,25 +332,27 @@ export function parseSubscriptionContent(content) {
         return [];
     }
 
+    // Normalize non-standard VLESS links before parsing
+    const normalizedContent = normalizeVlessLinks(trimmed);
+
     // Try Sing-Box JSON first
-    const singboxResult = parseSingboxJson(trimmed);
+    const singboxResult = parseSingboxJson(normalizedContent);
     if (singboxResult) {
         return singboxResult;
     }
 
     // Try Clash YAML
-    const clashResult = parseClashYaml(trimmed);
+    const clashResult = parseClashYaml(normalizedContent);
     if (clashResult) {
         return clashResult;
     }
 
     // Try Surge INI
-    const surgeResult = parseSurgeIni(trimmed);
+    const surgeResult = parseSurgeIni(normalizedContent);
     if (surgeResult) {
         return surgeResult;
     }
 
     // Fallback: split by lines (for URI lists)
-    return trimmed.split('\n').filter(line => line.trim() !== '');
+    return normalizedContent.split('\n').filter(line => line.trim() !== '');
 }
-
