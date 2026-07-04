@@ -1,93 +1,111 @@
-import { decodeBase64 } from '../../utils.js';
+import { parseServerInfo, parseUrlParams, createTlsConfig, createTransportConfig, parseBool } from '../../utils.js';
 
-function normalizeArray(value) {
-    if (!value) return undefined;
-    return Array.isArray(value) ? value : [value];
+/**
+ * Decode Base64-encoded UUID section in non-standard VLESS links.
+ * Handles formats like:
+ *   auto:UUID, none:UUID, UUID@host:port, or just UUID encoded in Base64.
+ *
+ * @param {string} uuidPart - The UUID string from URL username section
+ * @returns {string} - Decoded UUID or original if not Base64 encoded
+ */
+function decodeVlessUuid(uuidPart) {
+    if (!uuidPart || typeof uuidPart !== 'string') {
+        return uuidPart;
+    }
+
+    const standardUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const compactUuidPattern = /^[0-9a-f]{32}$/i;
+
+    let decodedUuid = uuidPart;
+    try {
+        decodedUuid = decodeURIComponent(uuidPart);
+    } catch (e) {
+        // Not URL encoded, keep original
+    }
+
+    if (standardUuidPattern.test(decodedUuid) || compactUuidPattern.test(decodedUuid)) {
+        return decodedUuid;
+    }
+
+    if (uuidPart.length < 20 || !/^[A-Za-z0-9+/=]+$/.test(uuidPart)) {
+        return uuidPart;
+    }
+
+    let base64Decoded;
+    try {
+        base64Decoded = atob(uuidPart);
+    } catch (e) {
+        return uuidPart;
+    }
+
+    // Pattern: auto:UUID or none:UUID
+    if (base64Decoded.startsWith('auto:') || base64Decoded.startsWith('none:')) {
+        const uuid = base64Decoded.slice(5);
+        if (standardUuidPattern.test(uuid) || compactUuidPattern.test(uuid)) {
+            return uuid;
+        }
+    }
+
+    // Pattern: UUID@host:port (entire connection info encoded)
+    if (base64Decoded.includes('@')) {
+        const parts = base64Decoded.split('@');
+        const uuid = parts[0];
+        if (standardUuidPattern.test(uuid) || compactUuidPattern.test(uuid)) {
+            return uuid;
+        }
+    }
+
+    // Pattern: Just UUID
+    if (standardUuidPattern.test(base64Decoded) || compactUuidPattern.test(base64Decoded)) {
+        return base64Decoded;
+    }
+
+    return uuidPart;
 }
 
-function buildHttpHeaders(vmessConfig) {
-    const hostHeader = normalizeArray(vmessConfig.host || vmessConfig.sni);
-    if (vmessConfig.headers && typeof vmessConfig.headers === 'object') {
-        const normalized = {};
-        Object.entries(vmessConfig.headers).forEach(([key, value]) => {
-            const normalizedValue = normalizeArray(value)?.map(entry => `${entry}`);
-            if (normalizedValue && normalizedValue.length > 0) {
-                normalized[key] = normalizedValue;
+export function parseVless(url) {
+    let { addressPart, params, name } = parseUrlParams(url);
+
+    // Handle non-standard links where entire "prefix:UUID@host:port" is Base64 encoded.
+    // e.g., vless://BASE64(none:UUID@host:port)?query#fragment
+    if (!addressPart.includes('@')) {
+        try {
+            const decoded = atob(addressPart);
+            if (decoded.includes('@')) {
+                addressPart = decoded;
             }
-        });
-        if (hostHeader && !normalized.host) {
-            normalized.host = hostHeader;
-        }
-        if (Object.keys(normalized).length > 0) {
-            return normalized;
+        } catch (e) {
+            // Not valid Base64, keep original
         }
     }
-    return hostHeader ? { host: hostHeader } : undefined;
-}
 
-export function parseVmess(url) {
-    let base64WithFragment = url.replace('vmess://', '');
-    let tagOverride;
-    const hashPos = base64WithFragment.indexOf('#');
-    if (hashPos >= 0) {
-        tagOverride = decodeURIComponent(base64WithFragment.slice(hashPos + 1));
-        base64WithFragment = base64WithFragment.slice(0, hashPos);
-    }
+    const [uuidRaw, serverInfo] = addressPart.split('@');
+    const uuid = decodeVlessUuid(uuidRaw);
 
-    let vmessConfig = JSON.parse(decodeBase64(base64WithFragment));
-    let tls = { enabled: false };
-    let transport;
-    const networkType = vmessConfig.net || 'tcp';
-    const transportType = vmessConfig.type || networkType;
+    const { host, port } = parseServerInfo(serverInfo);
 
-    const tlsEnabled = vmessConfig.tls && vmessConfig.tls !== '' && vmessConfig.tls !== 'none';
-    if (tlsEnabled) {
-        tls = {
+    const tls = createTlsConfig(params);
+    if (tls.reality) {
+        tls.utls = {
             enabled: true,
-            server_name: vmessConfig.sni,
-            insecure: vmessConfig['skip-cert-verify'] || false
+            fingerprint: 'chrome'
         };
     }
+    const transport = params.type !== 'tcp' ? createTransportConfig(params) : undefined;
 
-    if (networkType === 'ws') {
-        transport = {
-            type: 'ws',
-            path: vmessConfig.path,
-            headers: { 'host': vmessConfig.host ? vmessConfig.host : vmessConfig.sni }
-        };
-    } else if ((networkType === 'tcp' && transportType === 'http') || networkType === 'http') {
-        const method = vmessConfig.method || 'GET';
-        const path = vmessConfig.path || '/';
-        transport = {
-            type: 'http',
-            method,
-            path: Array.isArray(path) ? path : [path],
-            headers: buildHttpHeaders(vmessConfig)
-        };
-    } else if (networkType === 'grpc') {
-        transport = {
-            type: 'grpc',
-            service_name: vmessConfig?.path || vmessConfig?.serviceName
-        };
-    } else if (networkType === 'h2') {
-        const hostValue = vmessConfig.host || vmessConfig.sni;
-        transport = {
-            type: 'h2',
-            path: vmessConfig.path,
-            host: hostValue ? (Array.isArray(hostValue) ? hostValue : [hostValue]) : undefined
-        };
-    }
+    // `udp` is a Clash-only flag; ClashConfigBuilder reads it, SingboxConfigBuilder strips it.
+    const udp = params.udp !== undefined ? parseBool(params.udp) : undefined;
 
     return {
-        tag: tagOverride || vmessConfig.ps,
-        type: 'vmess',
-        server: vmessConfig.add,
-        server_port: parseInt(vmessConfig.port),
-        uuid: vmessConfig.id,
-        alter_id: parseInt(vmessConfig.aid) || 0,
-        security: vmessConfig.scy || 'auto',
+        type: 'vless',
+        tag: name,
+        server: host,
+        server_port: port,
+        uuid: uuid,
         tcp_fast_open: false,
+        tls,
         transport,
-        tls: tls.enabled ? tls : undefined
+        flow: params.flow ?? undefined,
+        ...(udp !== undefined ? { udp } : {})
     };
 }
