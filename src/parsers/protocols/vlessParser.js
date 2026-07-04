@@ -1,12 +1,10 @@
 import { parseServerInfo, parseUrlParams, createTlsConfig, createTransportConfig, parseBool } from '../../utils.js';
 
 /**
- * Decode Base64-encoded UUID section in non-standard VLESS links
+ * Decode Base64-encoded UUID section in non-standard VLESS links.
  * Handles formats like:
- *   vless://YXV0bzpVVUlE@host:port?... (decodes to auto:UUID)
- *   vless://VVVJREBob3N0OnBvcnQ=... (decodes to UUID@host:port)
- *   vless://VVVJRA==@host:port?... (decodes to UUID)
- * 
+ *   auto:UUID, none:UUID, UUID@host:port, or just UUID encoded in Base64.
+ *
  * @param {string} uuidPart - The UUID string from URL username section
  * @returns {string} - Decoded UUID or original if not Base64 encoded
  */
@@ -15,12 +13,9 @@ function decodeVlessUuid(uuidPart) {
         return uuidPart;
     }
 
-    // Already standard UUID format (with or without dashes, or with URL encoding)
-    // Standard UUID: 8-4-4-4-12 hex format
     const standardUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const compactUuidPattern = /^[0-9a-f]{32}$/i;
-    
-    // URL decode first if needed
+
     let decodedUuid = uuidPart;
     try {
         decodedUuid = decodeURIComponent(uuidPart);
@@ -28,33 +23,30 @@ function decodeVlessUuid(uuidPart) {
         // Not URL encoded, keep original
     }
 
-    // Check if already standard format
     if (standardUuidPattern.test(decodedUuid) || compactUuidPattern.test(decodedUuid)) {
         return decodedUuid;
     }
 
-    // Check if looks like Base64 (long enough, only Base64 chars)
     if (uuidPart.length < 20 || !/^[A-Za-z0-9+/=]+$/.test(uuidPart)) {
         return uuidPart;
     }
 
-    // Try Base64 decode
     let base64Decoded;
     try {
         base64Decoded = atob(uuidPart);
     } catch (e) {
-        return uuidPart; // Not valid Base64
+        return uuidPart;
     }
 
-    // Pattern 1: auto:UUID
-    if (base64Decoded.startsWith('auto:')) {
-        const uuid = base64Decoded.slice(5); // Remove 'auto:' prefix
+    // Pattern: auto:UUID or none:UUID
+    if (base64Decoded.startsWith('auto:') || base64Decoded.startsWith('none:')) {
+        const uuid = base64Decoded.slice(5);
         if (standardUuidPattern.test(uuid) || compactUuidPattern.test(uuid)) {
             return uuid;
         }
     }
 
-    // Pattern 2: UUID@host:port (entire connection info encoded)
+    // Pattern: UUID@host:port (entire connection info encoded)
     if (base64Decoded.includes('@')) {
         const parts = base64Decoded.split('@');
         const uuid = parts[0];
@@ -63,22 +55,33 @@ function decodeVlessUuid(uuidPart) {
         }
     }
 
-    // Pattern 3: Just UUID (only UUID encoded in Base64)
+    // Pattern: Just UUID
     if (standardUuidPattern.test(base64Decoded) || compactUuidPattern.test(base64Decoded)) {
         return base64Decoded;
     }
 
-    // None matched, return original
     return uuidPart;
 }
 
 export function parseVless(url) {
-    const { addressPart, params, name } = parseUrlParams(url);
+    let { addressPart, params, name } = parseUrlParams(url);
+
+    // Handle non-standard links where entire "prefix:UUID@host:port" is Base64 encoded.
+    // e.g., vless://BASE64(none:UUID@host:port)?query#fragment
+    if (!addressPart.includes('@')) {
+        try {
+            const decoded = atob(addressPart);
+            if (decoded.includes('@')) {
+                addressPart = decoded;
+            }
+        } catch (e) {
+            // Not valid Base64, keep original
+        }
+    }
+
     const [uuidRaw, serverInfo] = addressPart.split('@');
-    
-    // Decode non-standard Base64-encoded UUID
     const uuid = decodeVlessUuid(uuidRaw);
-    
+
     const { host, port } = parseServerInfo(serverInfo);
 
     const tls = createTlsConfig(params);
