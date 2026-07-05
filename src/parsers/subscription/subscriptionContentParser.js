@@ -267,13 +267,13 @@ export function parseSubscriptionContent(content) {
     }
 
     // Try Clash YAML
-    const clashResult = parseClashYaml(normalizedContent);
+    const clashResult = parseClashYaml(trimmed);
     if (clashResult) {
         return clashResult;
     }
 
     // Try Surge INI
-    const surgeResult = parseSurgeIni(normalizedContent);
+    const surgeResult = parseSurgeIni(trimmed);
     if (surgeResult) {
         return surgeResult;
     }
